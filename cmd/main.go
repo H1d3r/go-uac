@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 	"github.com/Binject/debug/pe"
 )
@@ -132,31 +131,146 @@ func main() {
 }
 
 func checkProcessElevation(processName string) error {
-	psCommand := fmt.Sprintf(`Get-Process | Add-Member -Name Elevated -MemberType ScriptProperty -Value {if ($this.Name -in @('Idle','System')) {$null} else {-not $this.Path -and -not $this.Handle} } -PassThru | Where-Object {$_.Name -eq '%s'} | Format-Table Name,Elevated -AutoSize`, processName)
+	// PowerShell command that reliably detects elevation from non-elevated context
+	psCommand := fmt.Sprintf(`
+		$processes = Get-Process -Name '%s' -ErrorAction SilentlyContinue
+		if ($processes) {
+			$foundElevated = $false
+			foreach ($proc in $processes) {
+				try {
+					Write-Output "Process: $($proc.Name) (PID: $($proc.Id))"
+					
+					# Method 1: Check UAC Virtualization (elevated processes have this disabled)
+					$isElevated = $false
+					try {
+						Add-Type -TypeDefinition @"
+							using System;
+							using System.Runtime.InteropServices;
+							public class ProcessChecker {
+								[DllImport("kernel32.dll")]
+								public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+								
+								[DllImport("kernel32.dll")]
+								public static extern bool CloseHandle(IntPtr hObject);
+								
+								[DllImport("kernel32.dll")]
+								public static extern bool IsWow64Process(IntPtr hProcess, out bool Wow64Process);
+								
+								[DllImport("advapi32.dll")]
+								public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, uint TokenInformationLength, out uint ReturnLength);
+								
+								[DllImport("advapi32.dll")]
+								public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+								
+								public static bool IsProcessElevated(uint processId) {
+									IntPtr hProcess = OpenProcess(0x1000, false, processId);
+									if (hProcess == IntPtr.Zero) return false;
+									
+									IntPtr hToken;
+									if (!OpenProcessToken(hProcess, 0x0008, out hToken)) {
+										CloseHandle(hProcess);
+										return false;
+									}
+									
+									// Check for elevation using TokenElevation (20)
+									IntPtr elevationInfo = Marshal.AllocHGlobal(4);
+									uint returnLength;
+									bool result = GetTokenInformation(hToken, 20, elevationInfo, 4, out returnLength);
+									
+									bool isElevated = false;
+									if (result) {
+										isElevated = Marshal.ReadInt32(elevationInfo) != 0;
+									}
+									
+									Marshal.FreeHGlobal(elevationInfo);
+									CloseHandle(hToken);
+									CloseHandle(hProcess);
+									return isElevated;
+								}
+							}
+"@ -ErrorAction SilentlyContinue
+						
+						$isElevated = [ProcessChecker]::IsProcessElevated($proc.Id)
+						Write-Output "Token Elevation Check: $isElevated"
+					} catch {
+						Write-Output "Token Elevation Check: Failed - $($_.Exception.Message)"
+						
+						# Fallback method: Check process command line for elevation indicators
+						try {
+							$wmiProc = Get-WmiObject -Class Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
+							if ($wmiProc) {
+								$cmdLine = $wmiProc.CommandLine
+								Write-Output "Command Line: $cmdLine"
+								
+								# Check if running from System32 (elevated processes often run from real System32)
+								if ($proc.Path -and $proc.Path.ToLower().Contains("c:\windows\system32")) {
+									Write-Output "Running from System32: True"
+									$isElevated = $true
+								}
+								
+								# Check parent process
+								$parentId = $wmiProc.ParentProcessId
+								if ($parentId) {
+									$parent = Get-Process -Id $parentId -ErrorAction SilentlyContinue
+									if ($parent) {
+										Write-Output "Parent Process: $($parent.Name)"
+										# If parent is consent.exe, it's likely an elevated process from UAC
+										if ($parent.Name -eq "consent") {
+											$isElevated = $true
+										}
+									}
+								}
+							}
+						} catch {
+							Write-Output "WMI Fallback Failed: $($_.Exception.Message)"
+						}
+					}
+					
+					Write-Output "Final Elevation Status: $isElevated"
+					Write-Output "---"
+					
+					if ($isElevated) {
+						$foundElevated = $true
+					}
+				} catch {
+					Write-Output "Process: $($proc.Name) (PID: $($proc.Id)) - Error: $_"
+				}
+			}
+			
+			if ($foundElevated) {
+				exit 0
+			} else {
+				exit 1
+			}
+		} else {
+			Write-Output "No %s processes found"
+			exit 2
+		}`, processName, processName)
 	
 	cmd := exec.Command("powershell", "-c", psCommand)
 	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to run PowerShell command: %v", err)
+	exitCode := 0
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		exitCode = exitErr.ExitCode()
 	}
 	
 	result := string(output)
 	fmt.Printf("PowerShell elevation check result:\n%s", result)
-	lines := strings.Split(result, "\n")
-	for _, line := range lines {
-		if strings.Contains(strings.ToLower(line), strings.ToLower(processName)) {
-			if strings.Contains(strings.ToLower(line), "true") {
-				fmt.Printf("SUCCESS: %s is running elevated\n", processName)
-				return nil
-			} else if strings.Contains(strings.ToLower(line), "false") {
-				fmt.Printf("%s is running but NOT elevated\n", processName)
-				return nil
-			}
-		}
-	}
 	
-	fmt.Printf(" %s process not found or elevation status unclear\n", processName)
-	return nil
+	switch exitCode {
+	case 0:
+		fmt.Printf("SUCCESS: %s is running with elevated privileges\n", processName)
+		return nil
+	case 1:
+		fmt.Printf("%s is running but NOT elevated\n", processName)
+		return nil
+	case 2:
+		fmt.Printf("%s process not found\n", processName)
+		return nil
+	default:
+		fmt.Printf("Error checking %s elevation (exit code: %d)\n", processName, exitCode)
+		return fmt.Errorf("failed to run PowerShell command: %v", err)
+	}
 }
 
 func patchDLLWithShellcode(dllPath string, shellcode []byte) error {
