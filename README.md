@@ -2,6 +2,9 @@
 
 A UAC bypass technique using Windows directory parsing quirks and DLL hijacking with support for multiple auto-elevate binaries.
 
+## Demo 
+![demo4](https://github.com/user-attachments/assets/f1b2c0bb-d64f-45c0-939e-549f80b6e06d)
+
 ## How It Works
 
 This tool exploits Windows' inconsistent handling of directory names with trailing spaces:
@@ -54,7 +57,6 @@ go build -o uac-bypass.exe cmd/main.go
 # Use ComputerDefaults.exe with propsys.dll  
 ./uac-bypass.exe -method computerdefaults
 ```
-
 ### Command Line Options
 
 - `-method`: Choose bypass method
