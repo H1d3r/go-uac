@@ -41,6 +41,7 @@ The key insight is that `CreateProcess` and file APIs handle trailing spaces dif
 
 ```bash
 go mod tidy
+export CGO_ENABLED=1
 go build -o uac-bypass.exe cmd/main.go
 ```
 
